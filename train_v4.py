@@ -1,0 +1,259 @@
+import os
+import glob
+import json
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras import layers, models, regularizers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.models import load_model
+
+# ========================================================
+# 0. POSTURE CONFIGURATION
+# ========================================================
+POSTURE_INFO = {
+    0: {"label": "NUP",  "name": "Neutral Upright Posture", "desc": "Spine is straight and balanced."},
+    1: {"label": "LF",   "name": "Leaning Forward", "desc": "Torso leaning forward."},
+    2: {"label": "LB",   "name": "Leaning Backward", "desc": "Torso leaning backward."},
+    3: {"label": "LFSR", "name": "Leaning Forward & Support Right", "desc": "Leaning forward, resting head/arm on the right desk."},
+    4: {"label": "LFSL", "name": "Leaning Forward & Support Left", "desc": "Leaning forward, resting arm on the left desk."},
+    5: {"label": "CRL",  "name": "Cross Right Leg (Ankle on Knee)", "desc": "Right ankle resting on the left knee."},
+    6: {"label": "CLL",  "name": "Cross Left Leg (Ankle on Knee)", "desc": "Left ankle resting on the right knee."},
+    7: {"label": "CRLL", "name": "Cross Right Leg (Thigh on Thigh)", "desc": "Right thigh crossed over the left thigh."},
+    8: {"label": "CLLL", "name": "Cross Left Leg (Thigh on Thigh)", "desc": "Left thigh crossed over the right thigh."}
+}
+
+FILE_MAP = {
+    "straight": 0, "NUP": 0,
+    "leaning_forward": 1, "LF": 1,
+    "leaning_backward": 2, "LB": 2,
+    "support_right": 3, "LFSR": 3,
+    "support_left": 4, "LFSL": 4,
+    "cross_right_ankle": 5, "CRL": 5,
+    "cross_left_ankle": 6, "CLL": 6,
+    "cross_right_knee": 7, "CRLL": 7,
+    "cross_left_knee": 8, "CLLL": 8
+}
+
+# ========================================================
+# 1. DATA PROCESSING PIPELINE (PAPER-BASED)
+# ========================================================
+
+def paper_based_filter(df, noise_threshold=20):
+    """
+    Data filtering process: Crop first/last 10s, filter >50% contact area, filter total pressure error ±25%.
+    """
+    fsr_cols = ['FSR Front Left', 'FSR Front Mid', 'FSR Front Right', 
+                'FSR Mid Left', 'FSR Mid Mid', 'FSR Mid Right',
+                'FSR Back Left', 'FSR Back Mid', 'FSR Back Right']
+    
+    # 1. Crop the first and last 10 seconds (20 frames at 2Hz sampling rate)
+    crop_frames = 20
+    if len(df) <= crop_frames * 2:
+        return pd.DataFrame() 
+    
+    df_clean = df.iloc[crop_frames:-crop_frames].copy()
+    
+    # 2. Remove incomplete postures (Contact area < 50%, i.e., at least 5/9 sensors active)
+    active_sensors_count = (df_clean[fsr_cols] > noise_threshold).sum(axis=1)
+    df_clean = df_clean[active_sensors_count >= 5]
+    
+    if df_clean.empty:
+        return df_clean
+        
+    # 3. Filter sudden noise/spikes (±25% of the mean total pressure)
+    total_pressure = df_clean[fsr_cols].sum(axis=1)
+    mean_tp = total_pressure.mean()
+    lower_bound = mean_tp * 0.75 
+    upper_bound = mean_tp * 1.25 
+    
+    df_clean = df_clean[(total_pressure >= lower_bound) & (total_pressure <= upper_bound)]
+    return df_clean
+
+def prepare_data_pipeline_paper(data_folder='./datamix', FILE_MAP=None):
+    print("--- STARTING DATA PIPELINE (PAPER STANDARD) ---")
+    all_files = glob.glob(os.path.join(data_folder, "*.xlsx"))
+    fsr_cols = ['FSR Front Left', 'FSR Front Mid', 'FSR Front Right', 
+                'FSR Mid Left', 'FSR Mid Mid', 'FSR Mid Right',
+                'FSR Back Left', 'FSR Back Mid', 'FSR Back Right']
+
+    X_list, y_list = [], []
+
+    for file_path in all_files:
+        filename = os.path.basename(file_path).lower()
+        df = pd.read_excel(file_path)
+        df = df[df['Person Present'] == 1].copy()
+        
+        # Apply the paper-based filter
+        df = paper_based_filter(df)
+        
+        target_id = -1
+        sorted_keys = sorted(FILE_MAP.keys(), key=len, reverse=True)
+        for key in sorted_keys:
+            if key.lower() in filename:
+                target_id = FILE_MAP[key]
+                break
+        
+        if target_id != -1 and not df.empty:
+            X_list.append(df[fsr_cols].values)
+            y_list.append(np.full(len(df), target_id))
+            print(f"  + Filtered & retained {len(df)} frames: {filename} -> Class: {target_id}")
+
+    X_all = np.concatenate(X_list)
+    y_all = np.concatenate(y_list)
+    print(f"\n=> TOTAL VALID FRAMES FILTERED: {len(X_all)}")
+    return X_all, y_all
+
+# ========================================================
+# 2. TRAINING BLOCK (NEW ARCHITECTURE + 5-FOLD CV)
+# ========================================================
+
+def build_cnn_model():
+    """CNN Architecture inspired by the paper (32->64->128) + BatchNormalization"""
+    model = models.Sequential([
+        layers.Conv2D(32, (2, 2), padding='same', input_shape=(3, 3, 1)),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        
+        layers.Conv2D(64, (2, 2), padding='same'),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        
+        layers.Conv2D(128, (2, 2), padding='same'),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        
+        layers.Flatten(),
+        layers.Dense(128, kernel_regularizer=regularizers.l2(0.01)),
+        layers.BatchNormalization(),
+        layers.Activation('relu'),
+        layers.Dropout(0.5),
+        
+        layers.Dense(9, activation='softmax')
+    ])
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+def train_5_fold_cv(X_all, y_all):
+    print("\n--- STARTING 5-FOLD CROSS VALIDATION TRAINING ---")
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    fold_no = 1
+    acc_per_fold, loss_per_fold = [], []
+    best_model, best_scaler, best_acc = None, None, 0.0
+
+    for train_index, test_index in skf.split(X_all, y_all):
+        print(f"\n=================================")
+        print(f"   RUNNING FOLD {fold_no}/5")
+        print(f"=================================")
+        
+        X_train_raw, X_test_raw = X_all[train_index], X_all[test_index]
+        y_train, y_test = y_all[train_index], y_all[test_index]
+        
+        # Isolated Scaling for each Fold
+        scaler = MinMaxScaler()
+        X_train_scaled = scaler.fit_transform(X_train_raw)
+        X_test_scaled = scaler.transform(X_test_raw)
+        
+        X_train = X_train_scaled.reshape(-1, 3, 3, 1)
+        X_test = X_test_scaled.reshape(-1, 3, 3, 1)
+        
+        model = build_cnn_model()
+        early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
+        
+        # Train without verbose to keep the console clean
+        model.fit(
+            X_train, y_train, epochs=100, batch_size=64, 
+            validation_data=(X_test, y_test), callbacks=[early_stop, reduce_lr], verbose=0
+        )
+        
+        scores = model.evaluate(X_test, y_test, verbose=0)
+        print(f"-> Fold {fold_no} COMPLETED | Loss: {scores[0]:.4f} | Accuracy: {scores[1]*100:.2f}%")
+        
+        acc_per_fold.append(scores[1] * 100)
+        loss_per_fold.append(scores[0])
+        
+        if scores[1] > best_acc:
+            best_acc = scores[1]
+            best_model = model
+            best_scaler = scaler
+            
+        fold_no += 1
+
+    print("\n" + "="*50)
+    print("SUMMARY OF 5-FOLD CROSS VALIDATION RESULTS")
+    print("="*50)
+    print(f"Mean Accuracy: {np.mean(acc_per_fold):.2f}% (Standard Deviation: +/- {np.std(acc_per_fold):.2f}%)")
+    print(f"Mean Loss:     {np.mean(loss_per_fold):.4f}")
+    
+    # Save the best Model & Scaler
+    best_model.save('posture_9_model_mix_paper.h5')
+    joblib.dump(best_scaler, 'fsr_scaler_9_mix_paper.pkl')
+    print("\n--- SAVED THE BEST MODEL ---")
+    
+    return best_model, best_scaler
+
+# ========================================================
+# 3. INFERENCE BLOCK
+# ========================================================
+
+def predict_posture_9(raw_fsr_values, model, scaler):
+    if isinstance(raw_fsr_values, np.ndarray):
+        raw_fsr_values = raw_fsr_values.tolist()
+    else:
+        cleaned_values = []
+        for x in raw_fsr_values:
+            if isinstance(x, np.generic): cleaned_values.append(x.item())
+            else: cleaned_values.append(x)
+        raw_fsr_values = cleaned_values
+
+    input_scaled = scaler.transform([raw_fsr_values])
+    pred_probs = model.predict(input_scaled.reshape(1, 3, 3, 1), verbose=0)[0]
+    
+    class_id = np.argmax(pred_probs).item() 
+    info = POSTURE_INFO[class_id]
+    
+    result = {
+        "input_sensors": {
+            "Front": raw_fsr_values[0:3],
+            "Mid":   raw_fsr_values[3:6],
+            "Back":  raw_fsr_values[6:9]
+        },
+        "ai_output": {
+            "posture_id": class_id,
+            "label": info["label"],
+            "posture_name": info["name"],
+            "confidence": round(float(pred_probs[class_id]), 4)
+        }
+    }
+    return result
+
+# ==========================================
+# 4. FULL SYSTEM TEST EXECUTION
+# ==========================================
+if __name__ == "__main__":
+    print("=== STARTING OPTIMIZED AI SYSTEM PIPELINE (PAPER STANDARD) ===")
+
+    # STEP 1: Paper-standard Data Preprocessing
+    # Note: Using './lab_07052026' if './datamix' doesn't exist to ensure it runs
+    data_folder = './datamix'
+    if not os.path.exists(data_folder):
+        data_folder = './lab_07052026'
+        
+    X_all, y_all = prepare_data_pipeline_paper(data_folder=data_folder, FILE_MAP=FILE_MAP)
+    
+    # STEP 2: 5-Fold Cross Validation Training
+    best_model, best_scaler = train_5_fold_cv(X_all, y_all)
+    
+    # STEP 3: Real-time inference test with the best model
+    print("\n--- SINGLE SAMPLE PREDICTION TEST ---")
+    sample_data = [2846, 0, 3136, 3503, 0, 2047, 3235, 2220, 2237] 
+    
+    result = predict_posture_9(sample_data, best_model, best_scaler)
+    print(json.dumps(result, indent=4, ensure_ascii=False))
