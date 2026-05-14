@@ -181,7 +181,7 @@ def train_5_fold_cv(X_all, y_all, groups_all):
         # Train with more epochs
         model.fit(
             X_train, y_train, epochs=200, batch_size=32, 
-            validation_data=(X_test, y_test), callbacks=[early_stop, reduce_lr], verbose=0
+            validation_data=(X_test, y_test), callbacks=[early_stop, reduce_lr], verbose=1
         )
         
         scores = model.evaluate(X_test, y_test, verbose=0)
@@ -253,7 +253,7 @@ if __name__ == "__main__":
     print("=== STARTING OPTIMIZED AI SYSTEM PIPELINE (PAPER STANDARD) ===")
 
     # 1. CHOOSE YOUR DATA FOLDER HERE
-    DATA_FOLDER = './lab_07052026' 
+    DATA_FOLDER = './lab_14052026' 
     
     if not os.path.exists(DATA_FOLDER):
         print(f"❌ ERROR: Folder {DATA_FOLDER} not found!")

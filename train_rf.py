@@ -40,7 +40,7 @@ FILE_MAP = {
 # 1. DATA PROCESSING PIPELINE
 # ========================================================
 
-def prepare_data(data_folder='./lab_07052026'):
+def prepare_data(data_folder='./lab_14052026'):
     print(f"--- LOADING DATA FROM {data_folder} ---")
     all_files = glob.glob(os.path.join(data_folder, "*.xlsx"))
     
@@ -174,7 +174,7 @@ def train_rf_cv(X_all, y_all, groups_all):
 # 3. EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    DATA_FOLDER = './lab_07052026' 
+    DATA_FOLDER = './lab_14052026' 
     X_all, y_all, groups_all = prepare_data(data_folder=DATA_FOLDER)
     
     best_rf_model = train_rf_cv(X_all, y_all, groups_all)
