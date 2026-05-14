@@ -7,8 +7,8 @@ import joblib
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import GroupKFold
+from sklearn.preprocessing import MinMaxScaler, Normalizer
 from tensorflow.keras import layers, models, regularizers
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.models import load_model
@@ -78,13 +78,17 @@ def paper_based_filter(df, noise_threshold=20):
 def prepare_data_pipeline_paper(data_folder='./datamix', FILE_MAP=None):
     print("--- STARTING DATA PIPELINE (PAPER STANDARD) ---")
     all_files = glob.glob(os.path.join(data_folder, "*.xlsx"))
+    # Shuffle files to ensure better distribution in K-Fold
+    np.random.seed(42)
+    np.random.shuffle(all_files)
+    
     fsr_cols = ['FSR Front Left', 'FSR Front Mid', 'FSR Front Right', 
                 'FSR Mid Left', 'FSR Mid Mid', 'FSR Mid Right',
                 'FSR Back Left', 'FSR Back Mid', 'FSR Back Right']
 
-    X_list, y_list = [], []
+    X_list, y_list, group_list = [], [], []
 
-    for file_path in all_files:
+    for i, file_path in enumerate(all_files):
         filename = os.path.basename(file_path).lower()
         df = pd.read_excel(file_path)
         df = df[df['Person Present'] == 1].copy()
@@ -102,28 +106,34 @@ def prepare_data_pipeline_paper(data_folder='./datamix', FILE_MAP=None):
         if target_id != -1 and not df.empty:
             X_list.append(df[fsr_cols].values)
             y_list.append(np.full(len(df), target_id))
+            group_list.append(np.full(len(df), i)) # Mark each file as a unique group
             print(f"  + Filtered & retained {len(df)} frames: {filename} -> Class: {target_id}")
 
     X_all = np.concatenate(X_list)
     y_all = np.concatenate(y_list)
+    groups_all = np.concatenate(group_list)
     print(f"\n=> TOTAL VALID FRAMES FILTERED: {len(X_all)}")
-    return X_all, y_all
+    return X_all, y_all, groups_all
 
 # ========================================================
 # 2. TRAINING BLOCK (NEW ARCHITECTURE + 5-FOLD CV)
 # ========================================================
 
 def build_cnn_model():
-    """CNN Architecture inspired by the paper (32->64->128) + BatchNormalization"""
+    """Higher capacity CNN for 9 distinct postures"""
     model = models.Sequential([
-        layers.Conv2D(32, (2, 2), padding='same', input_shape=(3, 3, 1)),
+        layers.Input(shape=(3, 3, 1)),
+        # Very small noise to prevent over-reliance on exact values without blurring patterns
+        layers.GaussianNoise(0.002), 
+        
+        layers.Conv2D(32, (2, 2), padding='same'),
         layers.BatchNormalization(),
         layers.Activation('relu'),
         
         layers.Conv2D(64, (2, 2), padding='same'),
         layers.BatchNormalization(),
         layers.Activation('relu'),
-        
+
         layers.Conv2D(128, (2, 2), padding='same'),
         layers.BatchNormalization(),
         layers.Activation('relu'),
@@ -132,22 +142,23 @@ def build_cnn_model():
         layers.Dense(128, kernel_regularizer=regularizers.l2(0.01)),
         layers.BatchNormalization(),
         layers.Activation('relu'),
-        layers.Dropout(0.5),
+        layers.Dropout(0.4),
         
         layers.Dense(9, activation='softmax')
     ])
     model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
 
-def train_5_fold_cv(X_all, y_all):
-    print("\n--- STARTING 5-FOLD CROSS VALIDATION TRAINING ---")
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+def train_5_fold_cv(X_all, y_all, groups_all):
+    print("\n--- STARTING 5-FOLD CROSS VALIDATION TRAINING (GROUP-BASED) ---")
+    print("Note: Each fold will use completely separate sessions (files) for testing.")
+    skf = GroupKFold(n_splits=5)
     
     fold_no = 1
     acc_per_fold, loss_per_fold = [], []
     best_model, best_scaler, best_acc = None, None, 0.0
 
-    for train_index, test_index in skf.split(X_all, y_all):
+    for train_index, test_index in skf.split(X_all, y_all, groups=groups_all):
         print(f"\n=================================")
         print(f"   RUNNING FOLD {fold_no}/5")
         print(f"=================================")
@@ -155,8 +166,8 @@ def train_5_fold_cv(X_all, y_all):
         X_train_raw, X_test_raw = X_all[train_index], X_all[test_index]
         y_train, y_test = y_all[train_index], y_all[test_index]
         
-        # Isolated Scaling for each Fold
-        scaler = MinMaxScaler()
+        # Use Normalizer (L1) to convert to Relative Pressure %
+        scaler = Normalizer(norm='l1')
         X_train_scaled = scaler.fit_transform(X_train_raw)
         X_test_scaled = scaler.transform(X_test_raw)
         
@@ -164,12 +175,12 @@ def train_5_fold_cv(X_all, y_all):
         X_test = X_test_scaled.reshape(-1, 3, 3, 1)
         
         model = build_cnn_model()
-        early_stop = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
-        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
+        early_stop = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
+        reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10)
         
-        # Train without verbose to keep the console clean
+        # Train with more epochs
         model.fit(
-            X_train, y_train, epochs=100, batch_size=64, 
+            X_train, y_train, epochs=200, batch_size=32, 
             validation_data=(X_test, y_test), callbacks=[early_stop, reduce_lr], verbose=0
         )
         
@@ -213,8 +224,9 @@ def predict_posture_9(raw_fsr_values, model, scaler):
             else: cleaned_values.append(x)
         raw_fsr_values = cleaned_values
 
-    input_scaled = scaler.transform([raw_fsr_values])
-    pred_probs = model.predict(input_scaled.reshape(1, 3, 3, 1), verbose=0)[0]
+    # --- NEW: Apply Normalizer during Inference ---
+    input_norm = scaler.transform([raw_fsr_values])
+    pred_probs = model.predict(input_norm.reshape(1, 3, 3, 1), verbose=0)[0]
     
     class_id = np.argmax(pred_probs).item() 
     info = POSTURE_INFO[class_id]
@@ -240,16 +252,18 @@ def predict_posture_9(raw_fsr_values, model, scaler):
 if __name__ == "__main__":
     print("=== STARTING OPTIMIZED AI SYSTEM PIPELINE (PAPER STANDARD) ===")
 
-    # STEP 1: Paper-standard Data Preprocessing
-    # Note: Using './lab_07052026' if './datamix' doesn't exist to ensure it runs
-    data_folder = './datamix'
-    if not os.path.exists(data_folder):
-        data_folder = './lab_07052026'
+    # 1. CHOOSE YOUR DATA FOLDER HERE
+    DATA_FOLDER = './lab_07052026' 
+    
+    if not os.path.exists(DATA_FOLDER):
+        print(f"❌ ERROR: Folder {DATA_FOLDER} not found!")
+        exit()
         
-    X_all, y_all = prepare_data_pipeline_paper(data_folder=data_folder, FILE_MAP=FILE_MAP)
+    print(f"--- TRAINING ON FOLDER: {DATA_FOLDER} ---")
+    X_all, y_all, groups_all = prepare_data_pipeline_paper(data_folder=DATA_FOLDER, FILE_MAP=FILE_MAP)
     
     # STEP 2: 5-Fold Cross Validation Training
-    best_model, best_scaler = train_5_fold_cv(X_all, y_all)
+    best_model, best_scaler = train_5_fold_cv(X_all, y_all, groups_all)
     
     # STEP 3: Real-time inference test with the best model
     print("\n--- SINGLE SAMPLE PREDICTION TEST ---")
