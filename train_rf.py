@@ -4,6 +4,8 @@ import json
 import numpy as np
 import pandas as pd
 import joblib
+import re
+import shutil
 from sklearn.model_selection import GroupKFold
 from sklearn.preprocessing import Normalizer
 from sklearn.ensemble import RandomForestClassifier
@@ -166,8 +168,31 @@ def train_rf_cv(X_all, y_all, groups_all):
         print(f"{name}: {imp*100:.1f}%")
 
     # Lưu model
-    joblib.dump(best_model, 'posture_rf_model.pkl')
-    print("\n--- LƯU THÀNH CÔNG RANDOM FOREST MODEL ---")
+    # --- TỰ ĐỘNG ĐÁNH VERSION VÀ ĐỒNG BỘ ---
+    base_name = "posture_rf_model"
+    extension = ".pkl"
+    
+    # Tìm version tiếp theo
+    existing_files = glob.glob(f"{base_name}_v*{extension}")
+    max_v = 0
+    for f in existing_files:
+        match = re.search(r'_v(\d+)', f)
+        if match:
+            max_v = max(max_v, int(match.group(1)))
+    new_v = f"v{max_v + 1}"
+    final_filename = f"{base_name}_{new_v}{extension}"
+
+    # Lưu tại AI folder
+    joblib.dump(best_model, final_filename)
+    print(f"\n✅ [AI] Saved: {final_filename}")
+
+    # Đồng bộ sang Fog Node
+    fog_dir = "../smart-cushion-fog/ai/models"
+    if os.path.exists(fog_dir):
+        dest = os.path.join(fog_dir, final_filename)
+        shutil.copy(final_filename, dest)
+        print(f"🚀 [FOG] Synced: {dest}")
+
     return best_model
 
 # ==========================================

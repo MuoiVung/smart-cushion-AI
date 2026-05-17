@@ -3,6 +3,8 @@ import numpy as np
 import os
 import glob
 import joblib
+import re
+import shutil
 from xgboost import XGBClassifier
 from sklearn.model_selection import GroupKFold
 from sklearn.metrics import accuracy_score, classification_report
@@ -188,10 +190,34 @@ def train_xgb_cv(X_all, y_all, groups_all):
     for name, imp in zip(feature_names, importances):
         print(f"{name}: {imp*100:.1f}%")
 
-    # Lưu model và label encoder
-    joblib.dump(best_model, 'posture_xgb_model.pkl')
-    joblib.dump(le, 'posture_xgb_le.pkl')
-    print("\n--- LƯU THÀNH CÔNG XGBOOST MODEL & LE ---")
+    # --- TỰ ĐỘNG ĐÁNH VERSION VÀ ĐỒNG BỘ ---
+    model_base = "posture_xgb_model"
+    le_base = "posture_xgb_le"
+    extension = ".pkl"
+    
+    # Tìm version tiếp theo dựa trên file model
+    existing_models = glob.glob(f"{model_base}_v*{extension}")
+    max_v = 0
+    for f in existing_models:
+        match = re.search(r'_v(\d+)', f)
+        if match: max_v = max(max_v, int(match.group(1)))
+    
+    new_v = f"v{max_v + 1}"
+    model_name = f"{model_base}_{new_v}{extension}"
+    le_name = f"{le_base}_{new_v}{extension}"
+
+    # Lưu tại AI folder
+    joblib.dump(best_model, model_name)
+    joblib.dump(le, le_name)
+    print(f"\n✅ [AI] Saved: {model_name} & {le_name}")
+
+    # Đồng bộ sang Fog Node
+    fog_dir = "../smart-cushion-fog/ai/models"
+    if os.path.exists(fog_dir):
+        shutil.copy(model_name, os.path.join(fog_dir, model_name))
+        shutil.copy(le_name, os.path.join(fog_dir, le_name))
+        print(f"🚀 [FOG] Synced models to Fog Node directory.")
+
     return best_model, le
 
 # ==========================================

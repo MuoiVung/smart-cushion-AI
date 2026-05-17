@@ -4,6 +4,8 @@ import json
 import numpy as np
 import pandas as pd
 import joblib
+import re
+import shutil
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
@@ -203,10 +205,32 @@ def train_5_fold_cv(X_all, y_all, groups_all):
     print(f"Mean Accuracy: {np.mean(acc_per_fold):.2f}% (Standard Deviation: +/- {np.std(acc_per_fold):.2f}%)")
     print(f"Mean Loss:     {np.mean(loss_per_fold):.4f}")
     
-    # Save the best Model & Scaler
-    best_model.save('posture_9_model_mix_paper.h5')
-    joblib.dump(best_scaler, 'fsr_scaler_9_mix_paper.pkl')
-    print("\n--- SAVED THE BEST MODEL ---")
+    # --- TỰ ĐỘNG ĐÁNH VERSION VÀ ĐỒNG BỘ ---
+    model_base = "posture_9_model_mix_paper"
+    scaler_base = "fsr_scaler_9_mix_paper"
+    
+    # Tìm version tiếp theo dựa trên file .h5
+    existing_models = glob.glob(f"{model_base}_v*.h5")
+    max_v = 0
+    for f in existing_models:
+        match = re.search(r'_v(\d+)', f)
+        if match: max_v = max(max_v, int(match.group(1)))
+    
+    new_v = f"v{max_v + 1}"
+    model_name = f"{model_base}_{new_v}.h5"
+    scaler_name = f"{scaler_base}_{new_v}.pkl"
+
+    # Lưu tại AI folder
+    best_model.save(model_name)
+    joblib.dump(best_scaler, scaler_name)
+    print(f"\n✅ [AI] Saved: {model_name} & {scaler_name}")
+
+    # Đồng bộ sang Fog Node
+    fog_dir = "../smart-cushion-fog/ai/models"
+    if os.path.exists(fog_dir):
+        shutil.copy(model_name, os.path.join(fog_dir, model_name))
+        shutil.copy(scaler_name, os.path.join(fog_dir, scaler_name))
+        print(f"🚀 [FOG] Synced models to Fog Node directory.")
     
     return best_model, best_scaler
 
